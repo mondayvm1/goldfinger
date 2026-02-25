@@ -1,0 +1,30 @@
+# Secrets
+.env
+*.pem
+config/*.pem
+
+# Python
+__pycache__/
+*.pyc
+*.py[cod]
+.venv/
+venv/
+dist/
+build/
+*.egg-info/
+
+# Data (trade logs)
+data/
+
+# PDFs / datasets
+Stock Market Bot Datasets/
+*.pdf
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE / Tools
+.vscode/
+.idea/
+.claude/
