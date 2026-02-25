@@ -1,5 +1,6 @@
 # Secrets
 .env
+.env.local
 *.pem
 config/*.pem
 
@@ -12,6 +13,11 @@ venv/
 dist/
 build/
 *.egg-info/
+
+# Node.js
+node_modules/
+.next/
+out/
 
 # Data (trade logs)
 data/

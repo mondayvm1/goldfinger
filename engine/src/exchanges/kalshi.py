@@ -50,6 +50,27 @@ class KalshiClient:
             base_url=base_url,
         )
 
+    @classmethod
+    def from_credentials(
+        cls,
+        api_key: str,
+        pem_content: str,
+        base_url: str = PROD_BASE,
+    ) -> "KalshiClient":
+        """Create client from raw credentials (multi-user mode).
+
+        Args:
+            api_key: Kalshi API key ID (UUID).
+            pem_content: PEM private key as a string (not a file path).
+            base_url: API base URL.
+        """
+        instance = cls(api_key=api_key, base_url=base_url)
+        pem_bytes = pem_content.encode() if isinstance(pem_content, str) else pem_content
+        instance._private_key = serialization.load_pem_private_key(
+            pem_bytes, password=None
+        )
+        return instance
+
     async def close(self):
         await self._client.aclose()
 

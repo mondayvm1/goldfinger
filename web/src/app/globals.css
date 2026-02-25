@@ -1,0 +1,95 @@
+@import "tailwindcss";
+
+/* ── Goldfinger Theme ─────────────────────────────────────── */
+
+@theme inline {
+  --color-gold: #d4af37;
+  --color-gold-light: #f0d060;
+  --color-gold-dark: #b8960c;
+  --color-bg-primary: #0a0a0f;
+  --color-bg-card: #111118;
+  --color-bg-card-hover: #1a1a24;
+  --color-border: #2a2a3a;
+  --color-text-primary: #f0f0f0;
+  --color-text-secondary: #8888aa;
+  --color-green: #22c55e;
+  --color-red: #ef4444;
+  --font-sans: var(--font-geist-sans);
+  --font-mono: var(--font-geist-mono);
+}
+
+body {
+  background: var(--color-bg-primary);
+  color: var(--color-text-primary);
+  font-family: var(--font-sans), system-ui, sans-serif;
+}
+
+/* ── Glass card ───────────────────────────────────────────── */
+.glass-card {
+  background: rgba(17, 17, 24, 0.8);
+  backdrop-filter: blur(20px);
+  border: 1px solid var(--color-border);
+  border-radius: 16px;
+  transition: all 0.3s ease;
+}
+
+.glass-card:hover {
+  border-color: rgba(212, 175, 55, 0.3);
+  box-shadow: 0 0 30px rgba(212, 175, 55, 0.05);
+}
+
+/* ── Gold gradient text ───────────────────────────────────── */
+.gold-text {
+  background: linear-gradient(135deg, #d4af37, #f0d060);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+
+/* ── Signal stars ─────────────────────────────────────────── */
+.star-filled {
+  color: #d4af37;
+  text-shadow: 0 0 8px rgba(212, 175, 55, 0.5);
+}
+
+.star-empty {
+  color: #333;
+}
+
+/* ── Radar sweep animation ────────────────────────────────── */
+@keyframes radar-sweep {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+.radar-sweep {
+  animation: radar-sweep 3s linear infinite;
+}
+
+/* ── Pulse glow ───────────────────────────────────────────── */
+@keyframes pulse-gold {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(212, 175, 55, 0.4); }
+  50% { box-shadow: 0 0 20px 5px rgba(212, 175, 55, 0.2); }
+}
+
+.pulse-gold {
+  animation: pulse-gold 2s ease-in-out infinite;
+}
+
+/* ── Scrollbar ────────────────────────────────────────────── */
+::-webkit-scrollbar {
+  width: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: var(--color-bg-primary);
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--color-border);
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-gold-dark);
+}
