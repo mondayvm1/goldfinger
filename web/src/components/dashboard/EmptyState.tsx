@@ -44,7 +44,7 @@ export function EmptyState({ hasKeys, isScanning }: EmptyStateProps) {
         </div>
         <h3 className="text-xl font-bold mb-2 gold-text">Scanning Markets</h3>
         <p className="text-text-secondary">
-          Analyzing BTC, ETH, SOL prediction markets...
+          Analyzing BTC, ETH prediction markets...
         </p>
       </div>
     );

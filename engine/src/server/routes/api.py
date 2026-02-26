@@ -15,7 +15,7 @@ from fastapi import APIRouter, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from ..scanner import run_scan, run_scan_for_user, run_trade, run_trade_for_user
+from ..scanner import run_scan, run_scan_for_user, run_trade, run_trade_for_user, sync_trades_for_user
 from ..firewall import sanitize_recommendations, sanitize_stats
 
 logger = logging.getLogger(__name__)
@@ -40,6 +40,13 @@ class TradeRequest(BaseModel):
     side: str
     price: float
     count: int
+
+
+class SyncRequest(BaseModel):
+    user_id: str
+    api_key_enc: str
+    private_key_enc: str
+    trades: list[dict]  # [{id, order_id, ticker, side, price, count, fee}]
 
 
 # ── Health check ─────────────────────────────────────────────
@@ -143,4 +150,24 @@ async def trade(payload: dict):
         return JSONResponse(
             status_code=500,
             content={"success": False, "error": str(e)},
+        )
+
+
+# ── Sync endpoint (check settlements) ────────────────────────
+
+@router.post("/sync-trades")
+async def sync_trades(req: SyncRequest):
+    """Check Kalshi for settlement results on user's pending trades."""
+    try:
+        updates = await sync_trades_for_user(
+            api_key_enc=req.api_key_enc,
+            private_key_enc=req.private_key_enc,
+            trades=req.trades,
+        )
+        return {"updates": updates}
+    except Exception as e:
+        logger.error(f"Trade sync failed (user={req.user_id}): {e}", exc_info=True)
+        return JSONResponse(
+            status_code=500,
+            content={"error": "Sync failed."},
         )

@@ -33,6 +33,90 @@ logger = logging.getLogger(__name__)
 PNL_DIR = Path("data/pnl")
 
 
+# ── Multi-user trade sync (checks Kalshi for settlements) ────
+
+async def sync_trades_for_user(
+    api_key_enc: str,
+    private_key_enc: str,
+    trades: list[dict],
+) -> list[dict]:
+    """Check Kalshi for settlement results on a list of trades.
+
+    Args:
+        api_key_enc: Fernet-encrypted API key.
+        private_key_enc: Fernet-encrypted PEM key.
+        trades: List of dicts with: id, order_id, ticker, side, price, count, fee
+
+    Returns:
+        List of dicts with updated status/pnl for each trade that changed.
+    """
+    api_key = decrypt(api_key_enc)
+    pem_content = decrypt(private_key_enc)
+    client = KalshiClient.from_credentials(api_key, pem_content)
+
+    updates = []
+
+    async with client:
+        for trade in trades:
+            ticker = trade.get("ticker", "")
+            trade_id = trade.get("id", "")
+            order_id = trade.get("order_id")
+            side = trade.get("side", "yes")
+            price = float(trade.get("price", 0))
+            count = int(trade.get("count", 0))
+            fee = float(trade.get("fee", 0))
+
+            try:
+                # Check if market has settled
+                mdata = await client._get(f"/markets/{ticker}")
+                market = mdata.get("market", mdata)
+                result = market.get("result", "")
+                market_status = market.get("status", "")
+
+                if result in ("yes", "no"):
+                    # Market settled — calculate PnL
+                    cost = price * count + fee
+                    won = (side == result)
+                    payout = (count * 1.0) if won else 0.0
+                    pnl = round(payout - cost, 4)
+
+                    updates.append({
+                        "id": trade_id,
+                        "status": "settled",
+                        "pnl": pnl,
+                        "settled_price": 1.0 if won else 0.0,
+                    })
+                    outcome = "WIN" if won else "LOSS"
+                    logger.info(f"Trade settled [{outcome}]: {ticker} -> PnL ${pnl:+.4f}")
+
+                elif market_status == "closed" and result == "":
+                    # Market closed but not yet settled (in settlement process)
+                    updates.append({
+                        "id": trade_id,
+                        "status": "settling",
+                    })
+
+                else:
+                    # Check order status on Kalshi
+                    if order_id:
+                        try:
+                            odata = await client._get(f"/portfolio/orders/{order_id}", auth=True)
+                            order = odata.get("order", odata)
+                            new_status = order.get("status", "").lower()
+                            if new_status and new_status != trade.get("current_status", ""):
+                                updates.append({
+                                    "id": trade_id,
+                                    "status": new_status,
+                                })
+                        except Exception as e:
+                            logger.debug(f"Order lookup failed for {order_id}: {e}")
+
+            except Exception as e:
+                logger.warning(f"Sync failed for {ticker}: {e}")
+
+    return updates
+
+
 # ── Core scan logic (shared between modes) ───────────────────
 
 async def _scan_with_client(
@@ -87,11 +171,11 @@ async def _scan_with_client(
             except Exception as e:
                 logger.warning(f"Settlement check failed: {e}")
 
-        # Fetch markets (3 expiry windows)
+        # Fetch markets (4 expiry windows = ~60 min of upcoming markets)
         all_markets = []
         for asset in assets:
             try:
-                markets = await client.get_15min_markets(asset, max_windows=3)
+                markets = await client.get_15min_markets(asset, max_windows=4)
                 all_markets.extend(markets)
             except Exception as e:
                 logger.warning(f"{asset} markets failed: {e}")

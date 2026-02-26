@@ -111,3 +111,39 @@ export async function executeTrade(req: TradeRequest): Promise<TradeResponse> {
     body: req,
   });
 }
+
+// ── Sync Trades ──────────────────────────────────────────────
+
+export interface SyncTradesRequest {
+  user_id: string;
+  api_key_enc: string;
+  private_key_enc: string;
+  trades: {
+    id: string;
+    order_id: string | null;
+    ticker: string;
+    side: string;
+    price: number;
+    count: number;
+    fee: number;
+    current_status: string;
+  }[];
+}
+
+export interface TradeUpdate {
+  id: string;
+  status: string;
+  pnl?: number;
+  settled_price?: number;
+}
+
+export interface SyncTradesResponse {
+  updates: TradeUpdate[];
+}
+
+export async function syncTrades(req: SyncTradesRequest): Promise<SyncTradesResponse> {
+  return engineFetch<SyncTradesResponse>({
+    path: "/api/sync-trades",
+    body: req,
+  });
+}

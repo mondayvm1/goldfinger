@@ -3,8 +3,12 @@
 Prices binary options using a log-normal model (Black-Scholes d2 term)
 and finds mispriced contracts vs the market.
 
-Enhanced with EMA-20 trend confluence, asymmetric R/R filtering,
-confidence scoring, and data-driven filters from 44-trade history analysis.
+v3 — Recalibrated after live-trade analysis:
+  - Raised vol estimates (model was underestimating crypto moves → phantom edges)
+  - Tightened filters (edge, confidence, R/R) to reject low-quality trades
+  - Reduced position sizes while model calibrates
+  - Heavy counter-trend penalty (almost blocks counter-trend trades)
+  - Max position cap to limit single-trade exposure
 """
 
 from __future__ import annotations
@@ -20,43 +24,51 @@ from ..models import Market, Side, TradeRecommendation
 
 logger = logging.getLogger(__name__)
 
-# ── Data-driven constants (from 44-trade statistical analysis) ──────────
+# ── Data-driven constants ─────────────────────────────────────────────
 
-# Annualized volatility estimates
-DEFAULT_VOL = {"BTC": 0.60, "ETH": 0.70, "SOL": 1.10}
+# Annualized volatility estimates — RAISED significantly.
+# Previous: BTC 0.60, ETH 0.70 → model under-priced large moves,
+# creating false edges (especially on NO side). Higher vol → fair values
+# closer to 50% → only genuine mispricings survive.
+DEFAULT_VOL = {"BTC": 0.80, "ETH": 0.90}
 
-# Minimum edge (dollars) to recommend a trade
-MIN_EDGE = 0.05
+# Minimum edge (dollars) to recommend a trade.
+# Raised from 0.03 → 0.06. Small edges are market-maker noise, not alpha.
+MIN_EDGE = 0.06
 
-# Max contract price — sweet spot is $0.04-$0.25 but allow up to $0.35 for
-# more opportunities. Above $0.35 the R/R drops below 2:1.
-MAX_PRICE = 0.35
+# Max contract price — lowered to 0.30 for better asymmetry.
+# At $0.30 you only need 43% accuracy to break even (vs 69% at $0.45).
+MAX_PRICE = 0.30
 
-# Minimum reward/risk ratio
-MIN_REWARD_RISK = 2.0
+# Minimum reward/risk ratio — raised to 2.5 for proper asymmetry.
+# Even with 35-40% win rate, 2.5:1 R/R is profitable.
+MIN_REWARD_RISK = 2.5
 
-# Confidence score threshold (0-100)
-MIN_CONFIDENCE = 50
+# Confidence score threshold — raised to 55 for quality.
+MIN_CONFIDENCE = 55
 
-# Time window sweet spot (minutes) — best results in this range
+# Time window: markets expiring in this range get max time points
 TIME_SWEET_SPOT = (5.0, 12.0)
+
+# Minimum minutes before expiry — raised to avoid last-minute noise
+MIN_MINUTES = 3.0
 
 # EMA period
 EMA_PERIOD = 20
 
-# Kelly fractions by asset (from optimal Kelly analysis):
-#   BTC optimal=31%, using 20%. ETH optimal=12%, using 10%.
-KELLY_BY_ASSET = {"BTC": 0.20, "ETH": 0.10}
-KELLY_DEFAULT = 0.10
+# Kelly fractions — dramatically reduced while calibrating.
+# Previous: BTC 0.20, ETH 0.12. Now tiny until model proves itself.
+KELLY_BY_ASSET = {"BTC": 0.08, "ETH": 0.06}
+KELLY_DEFAULT = 0.06
 
-# Kelly for NO side — conservative until we have proven track record
-KELLY_NO = {"BTC": 0.10, "ETH": 0.10}
+# Max contracts per trade — hard cap to limit exposure
+MAX_CONTRACTS = 10
 
-# Assets to scan — SOL has negative Kelly (-7.6%), losing money
+# Assets to scan — BTC + ETH only
 ENABLED_ASSETS = {"BTC", "ETH"}
 
 
-# ── Pricing model (unchanged) ──────────────────────────────────────────
+# ── Pricing model ─────────────────────────────────────────────────────
 
 def fair_value_binary(spot: float, strike: float, minutes_left: float, vol: float) -> float:
     """Compute fair value of a binary "above strike" option.
@@ -81,10 +93,10 @@ def fair_value_binary(spot: float, strike: float, minutes_left: float, vol: floa
     return float(norm.cdf(d2))
 
 
-# ── EMA + trend ────────────────────────────────────────────────────────
+# ── EMA + trend ───────────────────────────────────────────────────────
 
 def compute_ema(candles: list[dict], period: int = EMA_PERIOD) -> float | None:
-    """Compute EMA on close prices from CryptoCompare candle data.
+    """Compute EMA on close prices from candle data.
 
     Args:
         candles: List of candle dicts with 'close' key, oldest first.
@@ -108,19 +120,19 @@ def trend_direction(spot: float, ema: float | None) -> str:
     """Determine trend direction from spot vs EMA.
 
     Returns: 'bullish', 'bearish', or 'neutral'.
-    Uses 0.15% buffer so small fluctuations count as neutral, not bearish.
+    Uses 0.25% buffer to avoid false trend reads from minor fluctuations.
     """
     if ema is None:
         return "neutral"
     pct_diff = (spot - ema) / ema
-    if pct_diff > 0.0015:   # clearly above EMA
+    if pct_diff > 0.0025:   # clearly above EMA
         return "bullish"
-    elif pct_diff < -0.0015:  # clearly below EMA
+    elif pct_diff < -0.0025:  # clearly below EMA
         return "bearish"
     return "neutral"
 
 
-# ── Risk/reward + confidence ───────────────────────────────────────────
+# ── Risk/reward + confidence ──────────────────────────────────────────
 
 def reward_risk_ratio(price: float) -> float:
     """Reward/risk for a binary option at given price.
@@ -142,27 +154,41 @@ def compute_confidence(
 ) -> int:
     """Score a trade opportunity 0-100.
 
-    Components:
-      Edge size:      0-30 pts
-      EMA alignment:  0-25 pts  (side-aware: YES+bullish or NO+bearish = aligned)
+    v3 — Recalibrated scoring:
+      Edge size:      0-30 pts  (needs 6c+ to start scoring)
+      EMA alignment:  0-25 pts  (trend-aligned gets full bonus)
       Risk/reward:    0-20 pts
       Time window:    0-15 pts
+      Counter-trend:  -20 pts penalty (effectively blocks counter-trend)
+      Edge bonus:     +10 pts for very large edges (>12c)
     """
     score = 0
 
-    # Edge (0-30): edge 0.05 = 10pts, 0.15+ = 30pts
-    score += min(30, int(edge / 0.005))
+    # Edge (0-30): edge 0.06 = 6pts, 0.10 = 10pts, 0.15+ = 30pts
+    # Scale: divide by 0.01 so 6c edge = 6pts
+    score += min(30, int(edge / 0.01))
+
+    # Extra bonus for massive edge (>12c = likely genuine mispricing)
+    if edge >= 0.12:
+        score += 10
 
     # EMA alignment (0-25) — direction-aware
     aligned = (
         (side == Side.YES and trend == "bullish") or
         (side == Side.NO and trend == "bearish")
     )
+    counter = (
+        (side == Side.YES and trend == "bearish") or
+        (side == Side.NO and trend == "bullish")
+    )
+
     if aligned:
         score += 25
     elif trend == "neutral":
         score += 10
-    # against trend: 0 pts
+    elif counter:
+        # Heavy penalty — effectively blocks most counter-trend trades
+        score -= 20
 
     # Risk/reward (0-20)
     if rr >= 10:
@@ -171,21 +197,21 @@ def compute_confidence(
         score += 15
     elif rr >= 3:
         score += 10
-    elif rr >= 2:
-        score += 5
+    elif rr >= 2.5:
+        score += 7
 
-    # Time window (0-15)
+    # Time window (0-15) — sweet spot is 5-12 min
     if TIME_SWEET_SPOT[0] <= minutes_left <= TIME_SWEET_SPOT[1]:
         score += 15
     elif 3.0 <= minutes_left < TIME_SWEET_SPOT[0]:
         score += 8
-    elif TIME_SWEET_SPOT[1] < minutes_left <= 14.0:
+    elif TIME_SWEET_SPOT[1] < minutes_left <= 14.5:
         score += 10
 
     return max(0, min(100, score))
 
 
-# ── Market parsing helpers ─────────────────────────────────────────────
+# ── Market parsing helpers ────────────────────────────────────────────
 
 def parse_ticker_strike(ticker: str) -> float | None:
     """Extract strike price from a KXBTC15M ticker."""
@@ -248,15 +274,11 @@ def detect_asset(market: Market) -> str:
         return "BTC"
     if "ETH" in ticker or "ETHEREUM" in ticker:
         return "ETH"
-    if "SOL" in ticker or "SOLANA" in ticker:
-        return "SOL"
     q = (market.question or "").upper()
     if "BTC" in q or "BITCOIN" in q:
         return "BTC"
     if "ETH" in q or "ETHEREUM" in q:
         return "ETH"
-    if "SOL" in q or "SOLANA" in q:
-        return "SOL"
     return "BTC"
 
 
@@ -271,7 +293,7 @@ def minutes_until(close_time: datetime | None) -> float:
     return max(delta, 0.0)
 
 
-# ── Main strategy ──────────────────────────────────────────────────────
+# ── Main strategy ─────────────────────────────────────────────────────
 
 def find_opportunities(
     markets: list[Market],
@@ -279,19 +301,20 @@ def find_opportunities(
     balance: float = 0.0,
     ema_data: dict[str, float | None] | None = None,
 ) -> list[TradeRecommendation]:
-    """Scan markets for trend-aligned trades.
+    """Scan markets for mispriced contracts — evaluates BOTH sides of every market.
 
-    EMA-20 trend determines trade direction (confluence filter):
-      Bullish (spot > EMA) → BUY YES  (price rising toward strike)
-      Bearish (spot < EMA) → BUY NO   (price falling from strike)
-      Neutral              → BUY YES  (default, proven historical edge)
+    v3 recalibrated — tighter filters after live trading showed 7% win rate:
+      Root cause: vol too low → phantom edges, especially on NO side.
 
     Filters:
-    1. Asset filter:  BTC + ETH only (SOL has negative Kelly)
-    2. Price cap:     Max $0.35 (R/R must be ≥ 2:1)
-    3. EMA trend:     Determines YES vs NO side
-    4. Confidence:    Score 0-100, reject below 50
-    5. Per-ticker:    Max 1 recommendation per market
+    1. Asset filter:  BTC + ETH only
+    2. Time filter:   Min 3 min to expiry
+    3. Price cap:     Max $0.30 (breakeven at 43% win rate)
+    4. Edge:          Min 6 cents mispricing
+    5. R/R:           Min 2.5:1
+    6. Confidence:    Score ≥ 55
+    7. Position cap:  Max 10 contracts
+    8. Per-ticker:    Keep best opportunity per market
     """
     recs: list[TradeRecommendation] = []
 
@@ -312,7 +335,7 @@ def find_opportunities(
             continue
 
         mins_left = minutes_until(market.close_time)
-        if mins_left < 2.0:
+        if mins_left < MIN_MINUTES:
             continue  # too close to resolution
 
         vol = DEFAULT_VOL.get(asset, 0.65)
@@ -330,91 +353,91 @@ def find_opportunities(
 
         raw = market.raw
 
-        # ── Pick side based on trend confluence ──
-        if trend == "bearish":
-            # BEARISH → evaluate NO side (trade with the downtrend)
-            trade_side = Side.NO
-            fair_value = fv_no
+        # ── Evaluate YES side ──
+        yes_ask_raw = raw.get("yes_ask_dollars") or raw.get("yes_ask")
+        yes_price = _to_float(yes_ask_raw) or market.yes_price
+        if yes_price is not None and yes_price > 1.0:
+            yes_price = yes_price / 100.0
 
-            # Get NO ask price
-            no_ask_raw = raw.get("no_ask_dollars") or raw.get("no_ask")
-            trade_price = _to_float(no_ask_raw)
+        if yes_price is not None and 0 < yes_price <= MAX_PRICE:
+            yes_edge = fv_yes - yes_price
+            yes_rr = reward_risk_ratio(yes_price)
+            yes_conf = compute_confidence(yes_edge, trend, yes_rr, mins_left, side=Side.YES)
 
-            # Fallback: NO ask ≈ 1 - YES bid
-            if trade_price is None or trade_price > 1.0:
-                yes_bid_raw = raw.get("yes_bid_dollars") or raw.get("yes_bid")
-                yes_bid = _to_float(yes_bid_raw)
-                if yes_bid is not None and 0 < yes_bid < 1.0:
-                    trade_price = round(1.0 - yes_bid, 4)
-                elif market.yes_price is not None and 0 < market.yes_price < 1.0:
-                    trade_price = round(1.0 - market.yes_price, 4)
+            if yes_edge >= MIN_EDGE and yes_rr >= MIN_REWARD_RISK and yes_conf >= MIN_CONFIDENCE:
+                kelly_frac = KELLY_BY_ASSET.get(asset, KELLY_DEFAULT)
+                count = position_size(yes_edge, balance, yes_price, kelly_frac)
+                trend_emoji = "↑" if trend == "bullish" else "→" if trend == "neutral" else "↓"
 
-            # Convert from cents if needed
-            if trade_price is not None and trade_price > 1.0:
-                trade_price = trade_price / 100.0
+                recs.append(TradeRecommendation(
+                    ticker=market.market_id,
+                    side=Side.YES,
+                    price=yes_price,
+                    count=count,
+                    edge=round(yes_edge, 4),
+                    fair_value=round(fv_yes, 4),
+                    minutes_left=round(mins_left, 1),
+                    strike=strike,
+                    spot=spot,
+                    reason=(
+                        f"BUY YES: fair={fv_yes:.2%} vs ask={yes_price:.2%}, "
+                        f"edge={yes_edge:.2%}. {asset} ${spot:,.0f} {trend_emoji} strike "
+                        f"${strike:,.0f}, {mins_left:.0f}min left"
+                    ),
+                    confidence=yes_conf,
+                    trend=trend,
+                    rr_ratio=round(yes_rr, 1),
+                    ema=ema_val,
+                    asset=asset,
+                ))
 
-            kelly_frac = KELLY_NO.get(asset, KELLY_DEFAULT)
-            side_label = "NO"
-            trend_emoji = "↓"
-        else:
-            # BULLISH or NEUTRAL → evaluate YES side
-            trade_side = Side.YES
-            fair_value = fv_yes
+        # ── Evaluate NO side ──
+        no_ask_raw = raw.get("no_ask_dollars") or raw.get("no_ask")
+        no_price = _to_float(no_ask_raw)
 
-            yes_ask_raw = raw.get("yes_ask_dollars") or raw.get("yes_ask")
-            trade_price = _to_float(yes_ask_raw) or market.yes_price
+        # Fallback: NO ask ≈ 1 - YES bid
+        if no_price is None or no_price > 1.0:
+            yes_bid_raw = raw.get("yes_bid_dollars") or raw.get("yes_bid")
+            yes_bid = _to_float(yes_bid_raw)
+            if yes_bid is not None and 0 < yes_bid < 1.0:
+                no_price = round(1.0 - yes_bid, 4)
+            elif market.yes_price is not None and 0 < market.yes_price < 1.0:
+                no_price = round(1.0 - market.yes_price, 4)
 
-            kelly_frac = KELLY_BY_ASSET.get(asset, KELLY_DEFAULT)
-            side_label = "YES"
-            trend_emoji = "↑" if trend == "bullish" else "→"
+        if no_price is not None and no_price > 1.0:
+            no_price = no_price / 100.0
 
-        # ── Apply universal filters ──
-        if trade_price is None or trade_price <= 0:
-            continue
+        if no_price is not None and 0 < no_price <= MAX_PRICE:
+            no_edge = fv_no - no_price
+            no_rr = reward_risk_ratio(no_price)
+            no_conf = compute_confidence(no_edge, trend, no_rr, mins_left, side=Side.NO)
 
-        # Gate 2: Price cap
-        if trade_price > MAX_PRICE:
-            continue
+            if no_edge >= MIN_EDGE and no_rr >= MIN_REWARD_RISK and no_conf >= MIN_CONFIDENCE:
+                kelly_frac = KELLY_BY_ASSET.get(asset, KELLY_DEFAULT)
+                count = position_size(no_edge, balance, no_price, kelly_frac)
+                trend_emoji = "↓" if trend == "bearish" else "→" if trend == "neutral" else "↑"
 
-        # Gate 3: Edge
-        edge = fair_value - trade_price
-        if edge < MIN_EDGE:
-            continue
-
-        # Gate 4: R/R filter
-        rr = reward_risk_ratio(trade_price)
-        if rr < MIN_REWARD_RISK:
-            continue
-
-        # Gate 5: Confidence scoring (side-aware)
-        confidence = compute_confidence(edge, trend, rr, mins_left, side=trade_side)
-        if confidence < MIN_CONFIDENCE:
-            continue
-
-        # Position sizing
-        count = position_size(edge, balance, trade_price, kelly_frac)
-
-        recs.append(TradeRecommendation(
-            ticker=market.market_id,
-            side=trade_side,
-            price=trade_price,
-            count=count,
-            edge=round(edge, 4),
-            fair_value=round(fair_value, 4),
-            minutes_left=round(mins_left, 1),
-            strike=strike,
-            spot=spot,
-            reason=(
-                f"BUY {side_label}: fair={fair_value:.2%} vs ask={trade_price:.2%}, "
-                f"edge={edge:.2%}. {asset} ${spot:,.0f} {trend_emoji} strike "
-                f"${strike:,.0f}, {mins_left:.0f}min left"
-            ),
-            confidence=confidence,
-            trend=trend,
-            rr_ratio=round(rr, 1),
-            ema=ema_val,
-            asset=asset,
-        ))
+                recs.append(TradeRecommendation(
+                    ticker=market.market_id,
+                    side=Side.NO,
+                    price=no_price,
+                    count=count,
+                    edge=round(no_edge, 4),
+                    fair_value=round(fv_no, 4),
+                    minutes_left=round(mins_left, 1),
+                    strike=strike,
+                    spot=spot,
+                    reason=(
+                        f"BUY NO: fair={fv_no:.2%} vs ask={no_price:.2%}, "
+                        f"edge={no_edge:.2%}. {asset} ${spot:,.0f} {trend_emoji} strike "
+                        f"${strike:,.0f}, {mins_left:.0f}min left"
+                    ),
+                    confidence=no_conf,
+                    trend=trend,
+                    rr_ratio=round(no_rr, 1),
+                    ema=ema_val,
+                    asset=asset,
+                ))
 
     # Per-ticker dedup: keep highest confidence per ticker
     best_per_ticker: dict[str, TradeRecommendation] = {}
@@ -434,7 +457,8 @@ def position_size(
 ) -> int:
     """Position sizing using asset-specific fractional Kelly.
 
-    BTC uses 20% Kelly (optimal 31%), ETH uses 10% Kelly (optimal 12%).
+    v3 — Reduced fractions + hard cap at MAX_CONTRACTS.
+    BTC uses 8% Kelly, ETH uses 6% Kelly.
     """
     if balance <= 0 or price <= 0 or price >= 1.0:
         return 1
@@ -444,6 +468,8 @@ def position_size(
     fraction = kelly * kelly_fraction
     dollars = balance * fraction
     count = max(1, int(dollars / price))
+    # Hard cap to limit single-trade exposure
+    count = min(count, MAX_CONTRACTS)
     return count
 
 

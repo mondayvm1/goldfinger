@@ -321,23 +321,70 @@ class KalshiClient:
 
     # ── Spot price ───────────────────────────────────────────────────
 
-    async def get_spot_prices(self, assets: list[str] | None = None) -> dict[str, float]:
-        """Fetch spot prices using CryptoCompare (generous free tier)."""
-        if assets is None:
-            assets = ["BTC", "ETH", "SOL"]
+    # CoinGecko ID mapping (symbol → coingecko id)
+    _COINGECKO_IDS: dict[str, str] = {
+        "BTC": "bitcoin",
+        "ETH": "ethereum",
+    }
+    # Coinbase product mapping (symbol → product ID)
+    _COINBASE_PRODUCTS: dict[str, str] = {
+        "BTC": "BTC-USD",
+        "ETH": "ETH-USD",
+    }
 
-        fsyms = ",".join(a.upper() for a in assets)
-        url = f"https://min-api.cryptocompare.com/data/pricemulti?fsyms={fsyms}&tsyms=USD"
-        resp = await self._client.get(url)
-        resp.raise_for_status()
-        data = resp.json()
+    # In-memory spot price cache (shared across instances)
+    _spot_cache: dict[str, float] = {}
+    _spot_cache_time: float = 0.0
+    _SPOT_CACHE_TTL: float = 30.0  # seconds — avoid CoinGecko 429 rate limits
+
+    async def get_spot_prices(self, assets: list[str] | None = None) -> dict[str, float]:
+        """Fetch spot prices using CoinGecko (free, no API key needed).
+
+        Results are cached for 30s to respect CoinGecko's free-tier rate limit.
+        """
+        if assets is None:
+            assets = ["BTC", "ETH"]
+
+        # Return cached prices if still fresh
+        now = time.time()
+        if (now - self._spot_cache_time) < self._SPOT_CACHE_TTL and self._spot_cache:
+            cached = {k: v for k, v in self._spot_cache.items() if k in [a.upper() for a in assets]}
+            if len(cached) == len(assets):
+                logger.info(f"Spot prices (cached): {cached}")
+                return cached
+
+        # Map asset symbols to CoinGecko IDs
+        ids = []
+        asset_map: dict[str, str] = {}  # coingecko_id → our symbol
+        for a in assets:
+            key = a.upper()
+            cg_id = self._COINGECKO_IDS.get(key, key.lower())
+            ids.append(cg_id)
+            asset_map[cg_id] = key
+
+        url = (
+            f"https://api.coingecko.com/api/v3/simple/price"
+            f"?ids={','.join(ids)}&vs_currencies=usd"
+        )
+        try:
+            resp = await self._client.get(url)
+            resp.raise_for_status()
+            data = resp.json()
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 429 and self._spot_cache:
+                logger.warning("CoinGecko rate limited (429), using cached prices")
+                return {k: v for k, v in self._spot_cache.items() if k in [a.upper() for a in assets]}
+            raise
 
         prices = {}
-        for asset in assets:
-            key = asset.upper()
-            if key in data and "USD" in data[key]:
-                prices[key] = float(data[key]["USD"])
-                logger.info(f"Spot {key}: ${prices[key]:,.2f}")
+        for cg_id, symbol in asset_map.items():
+            if cg_id in data and "usd" in data[cg_id]:
+                prices[symbol] = float(data[cg_id]["usd"])
+                logger.info(f"Spot {symbol}: ${prices[symbol]:,.2f}")
+
+        # Update cache
+        KalshiClient._spot_cache.update(prices)
+        KalshiClient._spot_cache_time = now
         return prices
 
     async def get_spot_price(self, asset: str = "BTC") -> float:
@@ -348,19 +395,35 @@ class KalshiClient:
     async def get_candles(
         self, asset: str = "BTC", limit: int = 24
     ) -> list[dict]:
-        """Fetch recent 1-minute candles from CryptoCompare.
+        """Fetch recent 1-minute candles from Coinbase (free, no key, US-accessible).
 
         Returns list of dicts with keys: time, open, high, low, close.
         Ordered oldest-first. limit=24 gives 25 data points (enough for EMA-20).
         """
+        product = self._COINBASE_PRODUCTS.get(asset.upper(), f"{asset.upper()}-USD")
         url = (
-            f"https://min-api.cryptocompare.com/data/v2/histominute"
-            f"?fsym={asset.upper()}&tsym=USD&limit={limit}"
+            f"https://api.exchange.coinbase.com/products/{product}/candles"
+            f"?granularity=60"
         )
         resp = await self._client.get(url)
         resp.raise_for_status()
-        data = resp.json()
-        candles = data.get("Data", {}).get("Data", [])
+        raw = resp.json()
+
+        # Coinbase format: [time, low, high, open, close, volume] — newest first
+        # Take only what we need and reverse to oldest-first
+        entries = raw[: limit + 1]
+        entries.reverse()
+
+        candles = [
+            {
+                "time": int(k[0]),
+                "open": float(k[3]),
+                "high": float(k[2]),
+                "low": float(k[1]),
+                "close": float(k[4]),
+            }
+            for k in entries
+        ]
         logger.info(f"Fetched {len(candles)} 1-min candles for {asset}")
         return candles
 
