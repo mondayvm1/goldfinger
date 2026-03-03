@@ -9,13 +9,12 @@ export async function GET() {
   if (!session?.user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
   try {
-    const res = await fetch(`${ENGINE_URL}/api/settings`, {
+    const res = await fetch(`${ENGINE_URL}/api/paper`, {
       headers: { "Authorization": `Bearer ${ENGINE_API_KEY}` },
       signal: AbortSignal.timeout(5000),
     });
     if (!res.ok) throw new Error(`Engine returned ${res.status}`);
-    const data = await res.json();
-    return NextResponse.json(data);
+    return NextResponse.json(await res.json());
   } catch (err) {
     return NextResponse.json(
       { error: err instanceof Error ? err.message : "Engine unreachable" },
@@ -24,24 +23,25 @@ export async function GET() {
   }
 }
 
+// POST /api/engine/paper?action=reset
 export async function POST(req: NextRequest) {
   const session = await auth();
   if (!session?.user) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
 
+  const action = req.nextUrl.searchParams.get("action");
+  const body = await req.json().catch(() => ({}));
+
+  const endpoint = action === "reset" ? "/api/paper/reset" : "/api/paper";
+
   try {
-    const body = await req.json();
-    const res = await fetch(`${ENGINE_URL}/api/settings`, {
+    const res = await fetch(`${ENGINE_URL}${endpoint}`, {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${ENGINE_API_KEY}`,
-      },
+      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${ENGINE_API_KEY}` },
       body: JSON.stringify(body),
       signal: AbortSignal.timeout(5000),
     });
     if (!res.ok) throw new Error(`Engine returned ${res.status}`);
-    const data = await res.json();
-    return NextResponse.json(data);
+    return NextResponse.json(await res.json());
   } catch (err) {
     return NextResponse.json(
       { error: err instanceof Error ? err.message : "Engine unreachable" },

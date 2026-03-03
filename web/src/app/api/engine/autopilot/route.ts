@@ -17,7 +17,7 @@ export async function POST(req: NextRequest) {
   try {
     const res = await fetch(`${ENGINE_URL}/api/autopilot/${action}`, {
       method: "POST",
-      headers: { "X-API-Key": ENGINE_API_KEY },
+      headers: { "Authorization": `Bearer ${ENGINE_API_KEY}` },
       signal: AbortSignal.timeout(8000),
     });
     if (!res.ok) throw new Error(`Engine returned ${res.status}`);
@@ -38,7 +38,7 @@ export async function GET() {
 
   try {
     const res = await fetch(`${ENGINE_URL}/api/status`, {
-      headers: { "X-API-Key": ENGINE_API_KEY },
+      headers: { "Authorization": `Bearer ${ENGINE_API_KEY}` },
       signal: AbortSignal.timeout(5000),
     });
     if (!res.ok) throw new Error(`Engine returned ${res.status}`);
