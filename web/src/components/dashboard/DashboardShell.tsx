@@ -15,6 +15,7 @@ interface DashboardShellProps {
 
 const navItems = [
   { href: "/dashboard", label: "Dashboard", icon: "📡" },
+  { href: "/engine", label: "Engine", icon: "⚡" },
   { href: "/settings", label: "Settings", icon: "⚙️" },
 ];
 
